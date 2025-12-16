@@ -16,18 +16,18 @@ const std = @import("std");
 
 /// Load configuration from system environment variables
 pub fn load(comptime T: type, allocator: std.mem.Allocator) !T {
-    return loadCore(T, null, allocator);
+    return loadCore(T, null, allocator, false);
 }
 
 /// Load configuration from custom environment map
 pub fn loadMap(comptime T: type, env_map: std.process.EnvMap, allocator: std.mem.Allocator) !T {
-    return loadCore(T, env_map, allocator);
+    return loadCore(T, env_map, allocator, false);
 }
 
 /// Parse raw environment variable value into specified type
 /// Useful for custom parsers that want to preserve default parsing with additional validation
 pub fn parseValue(comptime T: type, raw_value: []const u8, allocator: std.mem.Allocator) !T {
-    return parseValueInternal(T, raw_value, null, allocator);
+    return parseValueInternal(T, raw_value, null, allocator, false);
 }
 
 /// Create a validator function that combines default parsing with custom validation
@@ -45,21 +45,9 @@ pub fn validator(comptime T: type, comptime validateFn: anytype) fn ([]const u8,
 //==============================================================================
 
 fn parseBool(val: []const u8) bool {
-    if (val.len <= 4) {
-        var lower_buf: [4]u8 = undefined;
-        for (val, 0..) |c, i| {
-            lower_buf[i] = std.ascii.toLower(c);
-        }
-        const lower = lower_buf[0..val.len];
-        return std.mem.eql(u8, lower, "true") or
-            std.mem.eql(u8, lower, "1") or
-            std.mem.eql(u8, lower, "yes");
-    }
-    return std.mem.eql(u8, val, "true") or
-        std.mem.eql(u8, val, "1") or
-        std.mem.eql(u8, val, "yes") or
-        std.mem.eql(u8, val, "TRUE") or
-        std.mem.eql(u8, val, "YES");
+    return std.ascii.eqlIgnoreCase(val, "true") or
+        std.ascii.eqlIgnoreCase(val, "1") or
+        std.ascii.eqlIgnoreCase(val, "yes");
 }
 
 fn isStringType(comptime T: type) bool {
@@ -166,7 +154,7 @@ fn hasAnyEnvVars(comptime T: type, env_map: std.process.EnvMap) bool {
 // Core
 //==============================================================================
 
-fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.Allocator) !T {
+fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.Allocator, duplicate: bool) !T {
     const type_info = @typeInfo(T);
     if (type_info != .@"struct") {
         @compileError("Expected struct type, got " ++ @typeName(T));
@@ -181,6 +169,8 @@ fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.A
         break :blk owned_env_map.?;
     };
 
+    const effective_duplicate = duplicate or (owned_env_map != null);
+
     inline for (type_info.@"struct".fields) |field| {
         const env_key = getEnvKey(field.name, T);
         const has_parser = comptime hasCustomParser(field.name, T);
@@ -189,14 +179,14 @@ fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.A
         const default_value = field.defaultValue();
 
         if (field_type_info == .@"struct") {
-            @field(result, field.name) = try parseValueInternal(field.type, "", env_map, allocator);
+            @field(result, field.name) = try parseValueInternal(field.type, "", active_env_map, allocator, effective_duplicate);
         } else if (is_optional) {
             const child_type = field_type_info.optional.child;
             const child_type_info = @typeInfo(child_type);
 
             if (child_type_info == .@"struct") {
                 if (hasAnyEnvVars(child_type, active_env_map)) {
-                    @field(result, field.name) = try parseValueInternal(child_type, "", env_map, allocator);
+                    @field(result, field.name) = try parseValueInternal(child_type, "", active_env_map, allocator, effective_duplicate);
                 } else {
                     @field(result, field.name) = if (default_value) |def| def else null;
                 }
@@ -205,7 +195,7 @@ fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.A
                     @field(result, field.name) = if (has_parser)
                         try callCustomParser(child_type, field.name, T, val, allocator)
                     else
-                        try parseValueInternal(child_type, val, env_map, allocator);
+                        try parseValueInternal(child_type, val, active_env_map, allocator, effective_duplicate);
                 } else {
                     @field(result, field.name) = if (default_value) |def| def else null;
                 }
@@ -217,7 +207,7 @@ fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.A
                 @field(result, field.name) = if (has_parser)
                     try callCustomParser(field.type, field.name, T, val, allocator)
                 else
-                    try parseValueInternal(field.type, val, env_map, allocator);
+                    try parseValueInternal(field.type, val, active_env_map, allocator, effective_duplicate);
             } else if (default_value) |def| {
                 @field(result, field.name) = def;
             } else {
@@ -233,15 +223,15 @@ fn loadCore(comptime T: type, env_map: ?std.process.EnvMap, allocator: std.mem.A
     return result;
 }
 
-fn parseValueInternal(comptime T: type, val: []const u8, env_map: ?std.process.EnvMap, allocator: std.mem.Allocator) !T {
+fn parseValueInternal(comptime T: type, val: []const u8, env_map: ?std.process.EnvMap, allocator: std.mem.Allocator, duplicate: bool) !T {
     const type_info = @typeInfo(T);
 
     if (type_info == .@"struct") {
-        return loadCore(T, env_map, allocator);
+        return loadCore(T, env_map, allocator, duplicate);
     }
 
     return switch (T) {
-        []const u8 => val,
+        []const u8 => if (duplicate) try allocator.dupe(u8, val) else val,
         i8, i16, i32, i64, i128, isize => std.fmt.parseInt(T, val, 10),
         u8, u16, u32, u64, u128, usize => std.fmt.parseInt(T, val, 10),
         f16, f32, f64, f80, f128 => std.fmt.parseFloat(T, val),
