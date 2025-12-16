@@ -37,7 +37,7 @@ Managing configuration with environment variables is common, but environment var
 Add this library to your project using `zig fetch`:
 
 ```bash
-zig fetch --save "git+https://github.com/xarunoba/env-struct.zig#v0.9.0"
+zig fetch --save "git+https://github.com/xarunoba/env-struct.zig#v0.10.0"
 ```
 
 Then in your `build.zig`:
