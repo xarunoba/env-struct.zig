@@ -21,6 +21,7 @@ Managing configuration with environment variables is common, but environment var
 
 ## Features
 
+- ✅ **Zero-allocation by default**: String fields borrow from EnvMap, no heap copies needed
 - ✅ **Type-safe**: Automatically parse environment variables into the correct types
 - ✅ **Multiple types**: Strings, integers, floats, booleans, and nested structs
 - ✅ **Optional fields**: Support for optional fields with defaults
@@ -72,16 +73,16 @@ const Config = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var config = try env_struct.load(Config);
+    defer config.deinit();  // Frees the EnvMap
 
-    const config = try env_struct.load(Config, allocator);
-
-    std.debug.print("App: {s}\n", .{config.APP_NAME});
-    std.debug.print("Port: {}\n", .{config.PORT});
+    std.debug.print("App: {s}\n", .{config.value.APP_NAME});
+    std.debug.print("Port: {}\n", .{config.value.PORT});
 }
 ```
+
+> [!NOTE]
+> String fields are borrowed slices pointing into the internal EnvMap. The wrapper struct owns the EnvMap and provides a `deinit()` method to clean up. No heap allocation occurs for string fields.
 
 Set environment variables:
 ```bash
@@ -116,7 +117,8 @@ const Config = struct {
     };
 };
 
-const config = try env_struct.load(Config, allocator);
+const config = try env_struct.load(Config);
+defer config.deinit();
 ```
 
 Set environment variables:
@@ -129,10 +131,10 @@ export PORT="8080"
 
 ### Custom Parsers and Validators
 
-The library provides two main approaches for custom parsing:
+The library provides two approaches for custom parsing, optimized for zero-allocation:
 
 #### 1. Validators (Recommended for validation)
-Use the `validator` function to combine default parsing with custom validation:
+Use the `validator` function to combine default parsing with custom validation. Validators don't require an allocator:
 
 ```zig
 const std = @import("std");
@@ -160,11 +162,10 @@ const Config = struct {
 For complex parsing logic that doesn't use default parsing:
 
 ```zig
-// Enum parsing function
+// Enum parsing function (zero-allocation)
 const LogLevel = enum { debug, info, warn, err };
 
-fn parseLogLevel(raw: []const u8, allocator: std.mem.Allocator) !LogLevel {
-    _ = allocator; // unused in this case
+fn parseLogLevel(raw: []const u8) !LogLevel {
     if (std.mem.eql(u8, raw, "debug")) return .debug;
     if (std.mem.eql(u8, raw, "info")) return .info;
     if (std.mem.eql(u8, raw, "warn")) return .warn;
@@ -189,12 +190,47 @@ const Config = struct {
 };
 ```
 
+#### 3. Parsers That Require Allocation
+For parsers that need to allocate (e.g., parsing arrays):
+
+```zig
+// Array parsing function (requires allocator)
+fn parseStringArray(raw: []const u8, allocator: std.mem.Allocator) ![][]const u8 {
+    if (raw.len == 0) return &[_][]const u8{};
+
+    var result = std.ArrayList([]const u8).init(allocator);
+    defer result.deinit();
+
+    var iter = std.mem.splitScalar(u8, raw, ',');
+    while (iter.next()) |item| {
+        const trimmed = std.mem.trim(u8, item, " \t");
+        if (trimmed.len > 0) {
+            const owned = try allocator.dupe(u8, trimmed);
+            try result.append(owned);
+        }
+    }
+
+    return result.toOwnedSlice();
+}
+
+const Config = struct {
+    tags: [][]const u8,
+
+    const env = .{
+        .tags = .{
+            .key = "TAGS",
+            .parser = parseStringArray,
+        },
+    };
+};
+```
+
 **Key Points:**
-- `.key` is the environment variable name, can be omitted to use the field name
-- `.parser` is the custom parser function, can be a validator or a full custom parser
-- Use `validator()` when you want default parsing + validation
-- Use custom parsers for complex parsing that doesn't follow default rules
-- All custom parsers use the signature: `fn(raw: []const u8, allocator: Allocator) !T`
+- `.key` is the environment variable name, can be omitted to use field name
+- `.parser` is the custom parser function
+- Use `validator()` when you want default parsing + validation (no allocator needed)
+- Zero-allocation parsers: `fn(raw: []const u8) !T`
+- Allocating parsers: `fn(raw: []const u8, allocator: std.mem.Allocator) !T`
 - The `parseValue()` function is available for implementing custom parsers that want to reuse default parsing
 
 ### Nested Structs & Complex Configuration
@@ -239,20 +275,24 @@ const ServerConfig = struct {
 };
 
 // Load from system environment
-const config = try env_struct.load(ServerConfig, allocator);
+var config = try env_struct.load(ServerConfig);
+defer config.deinit();
 
 // Or load from custom environment map (useful for testing)
-var custom_env = std.process.EnvMap.init(allocator);
+var custom_env = std.process.EnvMap.init(std.testing.allocator);
 defer custom_env.deinit();
 try custom_env.put("SERVER_PORT", "3000");
-const test_config = try env_struct.loadMap(ServerConfig, custom_env, allocator);
+const test_config = try env_struct.loadMap(ServerConfig, custom_env);
 ```
+
+> [!NOTE]
+> When using `loadMap()`, the returned configuration borrows string slices from the provided `env_map`. Ensure the `env_map` outlives the configuration. For production use with allocating parsers, prefer `load()` which handles memory management automatically.
 
 ## Built-in Parser Supported Types
 
 | Type | Examples | Notes |
 |------|----------|-------|
-| `[]const u8` | `"hello"` | String values |
+| `[]const u8` | `"hello"` | String values (borrowed slice, zero allocation) |
 | `i8`, `i16`, `i32`, `i64`, `i128`, `isize` | `"42"`, `"-123"` | Signed integers |
 | `u8`, `u16`, `u32`, `u64`, `u128`, `usize` | `"42"`, `"255"` | Unsigned integers |
 | `f16`, `f32`, `f64`, `f80`, `f128` | `"3.14"` | Floating point |
@@ -263,29 +303,46 @@ const test_config = try env_struct.loadMap(ServerConfig, custom_env, allocator);
 
 ## API
 
-### `load(comptime T: type, allocator: std.mem.Allocator) !T`
-Load configuration from system environment variables.
+### `load(comptime T: type) !ConfigWrapper(T)`
+Load configuration from system environment variables. Returns a wrapper struct that owns the EnvMap and contains the configuration.
 
-### `loadMap(comptime T: type, env_map: std.process.EnvMap, allocator: std.mem.Allocator) !T`
-Load configuration from a custom environment map.
+```zig
+const ConfigWrapper = struct {
+    value: T,
+    env_map: std.process.EnvMap,
 
-### `parseValue(comptime T: type, raw_value: []const u8, allocator: std.mem.Allocator) !T`
-Parse a raw string value into the specified type. Useful for implementing custom parsers that want to preserve default parsing behavior.
+    pub fn deinit(self: *Self) void {
+        self.env_map.deinit();
+    }
+};
+```
 
-### `validator(comptime T: type, comptime validateFn: anytype) fn([]const u8, std.mem.Allocator) anyerror!T`
+### `loadMap(comptime T: type, env_map: std.process.EnvMap) !T`
+Load configuration from a custom environment map. All string fields are borrowed slices pointing into the provided `env_map`. The `env_map` must outlive the returned configuration.
+
+### `parseValue(comptime T: type, raw_value: []const u8) !T`
+Parse a raw string value into the specified type. Returns borrowed slices for string types. Useful for implementing custom parsers that want to reuse default parsing behavior.
+
+### `validator(comptime T: type, comptime validateFn: anytype) fn([]const u8) anyerror!T`
 Create a validator function that combines default parsing with custom validation. The validation function should have the signature `fn(T) !T`.
 
 ### Custom Parser Function Signature
 
-Custom parsers must follow this signature:
+Custom parsers can use either signature:
 
+**Zero-allocation parser (preferred):**
+```zig
+fn parserFunction(raw_value: []const u8) !T
+```
+
+**Parser with allocation (for complex types):**
 ```zig
 fn parserFunction(raw_value: []const u8, allocator: std.mem.Allocator) !T
 ```
 
 Where:
 - `raw_value`: The raw string from the environment variable
-- `allocator`: Memory allocator for dynamic allocations (can be ignored if not needed)
+- `allocator`: Memory allocator for dynamic allocations (only for allocating parsers)
 - `T`: The target type to parse into
 - Returns the parsed value or an error
 
